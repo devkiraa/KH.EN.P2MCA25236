@@ -1,0 +1,19 @@
+{
+  "name": "logging-middleware",
+  "version": "1.0.0",
+  "description": "Logging middleware for campus notification platform",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node run_test.js",
+    "start": "node run_test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.16.0",
+    "dotenv": "^17.4.2"
+  }
+}
