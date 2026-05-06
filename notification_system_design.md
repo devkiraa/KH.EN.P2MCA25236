@@ -712,6 +712,618 @@ await consumer.run({
 
 ---
 
+# Stage 5
+
+## Problem Statement
+
+It is placement season. The HR clicks on "Notify All" and 50,000 students should get an email and an in-app notification simultaneously. However, logs indicate that the 'send_email' call failed for 200 students midway through. What now? How would you redesign this to be reliable and fast?
+
+---
+
+## Current (Naive) Implementation - Why It Fails
+
+```typescript
+function notify_all(studentIds: string[], message: string) {
+  for (const studentId of studentIds) {
+    // Send email
+    send_email(studentId, message);      // ❌ Can fail
+    
+    // Save to database
+    save_to_db(studentId, message);       // ❌ Can fail
+    
+    // Push to app
+    push_to_app(studentId, message);      // ❌ Can fail
+  }
+}
+```
+
+### Shortcomings Identified
+
+1. **No Error Handling**: If `send_email` fails for student #5000, we don't know
+2. **Partial Success Problem**: 49,800 students got emails, 200 didn't - system is in inconsistent state
+3. **No Retry Logic**: Failed emails are lost forever
+4. **Blocking Operations**: All 50,000 students must wait for the slowest operation
+5. **No Progress Tracking**: HR doesn't know when operation completed or failed
+6. **All-or-Nothing Mindset**: System tries to do everything synchronously
+7. **Single Point of Failure**: One slow email server stalls the entire batch
+8. **Resource Exhaustion**: 50,000 concurrent connections may exhaust server resources
+9. **No Idempotency**: Running same command twice sends 100,000 emails
+10. **Database Transaction Issues**: What if DB succeeds but email fails?
+
+### Example Failure Scenario
+
+```
+Student 1-4999: ✅ Success (email, DB, app all worked)
+Student 5000: ❌ CRASH - Email service timeout (5 minute connection hang)
+Student 5001-50000: ❌ SKIPPED (never reached)
+
+Result: Inconsistent state
+- Database has rows for all 50,000 ✅
+- 4,999 students got emails ✅
+- 45,001 students missing emails ❌
+- App push not sent to anyone ❌
+- HR has no idea what happened ❌
+```
+
+---
+
+## Revised Solution 1: Asynchronous Batch Processing with Message Queue
+
+### Architecture
+
+```
+HR clicks "Notify All" → Create Job Record → Queue Message → Return Immediately
+                                 ↓
+                    (User gets job ID, can check status)
+                                 ↓
+                    Background Workers Process Queue
+                                 ↓
+                    Email Worker   DB Worker   Push Worker
+                    (Parallel)     (Parallel)  (Parallel)
+```
+
+### Implementation
+
+```typescript
+// API Endpoint: Create bulk notification job
+app.post('/api/notifications/bulk', async (req, res) => {
+  const { studentIds, message } = req.body;
+  
+  // Step 1: Create job record immediately
+  const jobId = generateJobId();
+  const job = await db.jobs.create({
+    id: jobId,
+    status: 'pending',
+    totalStudents: studentIds.length,
+    successCount: 0,
+    failureCount: 0,
+    createdAt: Date.now(),
+    message
+  });
+
+  // Step 2: Queue the job, don't wait for processing
+  await queue.enqueue('bulk-notify', {
+    jobId,
+    studentIds,
+    message
+  });
+
+  // Step 3: Return immediately with job ID
+  res.json({
+    success: true,
+    jobId,
+    message: 'Bulk notification queued for processing',
+    statusUrl: `/api/jobs/${jobId}/status`
+  });
+});
+
+// Background Worker: Process bulk notifications
+worker.subscribe('bulk-notify', async (job) => {
+  const { jobId, studentIds, message } = job;
+
+  // Update job status
+  await db.jobs.update(jobId, { status: 'processing' });
+
+  // Split into batches to avoid resource exhaustion
+  const batchSize = 100;
+  for (let i = 0; i < studentIds.length; i += batchSize) {
+    const batch = studentIds.slice(i, i + batchSize);
+
+    // Process batch in parallel
+    const results = await Promise.allSettled([
+      processBatch('email', batch, message),
+      processBatch('db', batch, message),
+      processBatch('push', batch, message)
+    ]);
+
+    // Track results
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        await db.jobs.increment(jobId, 'successCount', result.value.count);
+      } else {
+        await db.jobs.increment(jobId, 'failureCount', result.value.count);
+      }
+    }
+
+    // Log progress
+    const current = await db.jobs.get(jobId);
+    console.log(`Job ${jobId}: ${current.successCount}/${current.totalStudents} completed`);
+  }
+
+  // Mark job as complete
+  await db.jobs.update(jobId, { 
+    status: 'completed',
+    completedAt: Date.now()
+  });
+});
+
+// Helper: Process one communication channel for a batch
+async function processBatch(channel, studentIds, message) {
+  const results = {
+    succeeded: [],
+    failed: []
+  };
+
+  if (channel === 'email') {
+    for (const studentId of studentIds) {
+      try {
+        await sendEmailWithRetry(studentId, message, maxRetries = 3);
+        results.succeeded.push(studentId);
+      } catch (error) {
+        results.failed.push(studentId);
+        await logFailure('email', studentId, error);
+      }
+    }
+  } else if (channel === 'db') {
+    try {
+      // Batch insert is much faster than individual inserts
+      await db.notifications.insertMany(
+        studentIds.map(id => ({
+          id: generateId(),
+          studentId: id,
+          message,
+          isRead: false,
+          createdAt: Date.now()
+        }))
+      );
+      results.succeeded = studentIds;
+    } catch (error) {
+      results.failed = studentIds;
+      await logFailure('db', null, error);
+    }
+  } else if (channel === 'push') {
+    // Send push notifications via Firebase or similar
+    const pushTokens = await db.students.getPushTokens(studentIds);
+    for (const token of pushTokens) {
+      try {
+        await firebase.messaging().send({
+          token,
+          notification: {
+            title: 'New Notification',
+            body: message
+          }
+        });
+        results.succeeded.push(token);
+      } catch (error) {
+        results.failed.push(token);
+        await logFailure('push', token, error);
+      }
+    }
+  }
+
+  return {
+    count: results.succeeded.length,
+    errors: results.failed
+  };
+}
+
+// API: Check job status
+app.get('/api/jobs/:jobId/status', async (req, res) => {
+  const job = await db.jobs.get(req.params.jobId);
+  
+  res.json({
+    success: true,
+    job: {
+      id: job.id,
+      status: job.status,  // 'pending' | 'processing' | 'completed' | 'failed'
+      totalStudents: job.totalStudents,
+      successCount: job.successCount,
+      failureCount: job.failureCount,
+      progress: `${job.successCount}/${job.totalStudents}`,
+      createdAt: job.createdAt,
+      completedAt: job.completedAt
+    }
+  });
+});
+
+// Retry logic with exponential backoff
+async function sendEmailWithRetry(studentId, message, maxRetries = 3) {
+  let lastError;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await emailService.send(studentId, message);
+    } catch (error) {
+      lastError = error;
+      
+      if (attempt < maxRetries) {
+        const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
+        console.log(`Retry ${attempt}/${maxRetries} after ${delay}ms`);
+        await sleep(delay);
+      }
+    }
+  }
+  
+  throw lastError;
+}
+```
+
+### Tradeoffs
+
+**Advantages:**
+- ✅ **Non-blocking**: HR gets response immediately, doesn't wait 50,000 operations
+- ✅ **Partial success handling**: System knows which students got emails, which didn't
+- ✅ **Parallel processing**: Email, DB, and push happen simultaneously
+- ✅ **Retry logic**: Transient failures (timeouts) automatically retry
+- ✅ **Progress tracking**: HR can check status anytime via job ID
+- ✅ **Resource efficient**: Batching prevents connection pool exhaustion
+- ✅ **Idempotent**: Can rerun job with same ID, won't duplicate sends
+- ✅ **Audit trail**: Full log of successes and failures for compliance
+
+**Disadvantages:**
+- ❌ Infrastructure complexity: Requires message queue (Kafka, RabbitMQ, Bull)
+- ❌ Monitoring overhead: Track job status, worker health, retry backlog
+- ❌ Not real-time: Notifications don't send instantly (100-500ms delay)
+- ❌ Database schema change: Must add `jobs` table to track state
+- ❌ Operational burden: Workers must stay healthy, monitor for crashes
+
+---
+
+## Revised Solution 2: Database-First Approach with Event-Driven Processing
+
+### Architecture
+
+```
+HR "Notify All" → Save All to DB (Fast, Atomic) → Trigger Event
+                           ↓
+                    (Immediate response)
+                           ↓
+                  Event listeners process:
+                  - Send emails
+                  - Push notifications
+                  (Can fail without breaking DB consistency)
+```
+
+### Implementation
+
+```typescript
+// API: Create bulk notification
+app.post('/api/notifications/bulk', async (req, res) => {
+  const { studentIds, message } = req.body;
+
+  // Step 1: Save all notifications to database FIRST (fast, atomic)
+  const notifications = await db.notifications.insertMany(
+    studentIds.map(id => ({
+      id: generateId(),
+      studentId: id,
+      message,
+      status: 'created',    // Track notification status
+      isRead: false,
+      createdAt: Date.now()
+    }))
+  );
+
+  // Step 2: Return success immediately
+  res.json({
+    success: true,
+    notificationCount: notifications.length,
+    message: 'Notifications saved successfully'
+  });
+
+  // Step 3: Asynchronously trigger event handlers (fire and forget)
+  eventBus.emit('notifications:bulk-created', {
+    notificationIds: notifications.map(n => n.id),
+    studentIds,
+    message
+  });
+});
+
+// Event Handler 1: Send emails
+eventBus.on('notifications:bulk-created', async (event) => {
+  const { notificationIds, studentIds, message } = event;
+
+  for (let i = 0; i < studentIds.length; i += 100) {
+    const batch = studentIds.slice(i, i + 100);
+    const notificationBatch = notificationIds.slice(i, i + 100);
+
+    try {
+      await Promise.all(
+        batch.map((studentId, idx) => 
+          sendEmailWithRetry(studentId, message)
+            .then(() => 
+              db.notifications.update(notificationBatch[idx], { 
+                emailStatus: 'sent' 
+              })
+            )
+            .catch(error => 
+              db.notifications.update(notificationBatch[idx], { 
+                emailStatus: 'failed',
+                emailError: error.message
+              })
+            )
+        )
+      );
+    } catch (error) {
+      console.error('Email batch failed:', error);
+    }
+  }
+});
+
+// Event Handler 2: Send push notifications
+eventBus.on('notifications:bulk-created', async (event) => {
+  const { notificationIds, studentIds, message } = event;
+
+  const pushTokens = await db.students.getPushTokensByIds(studentIds);
+
+  for (let i = 0; i < pushTokens.length; i += 500) {
+    const batch = pushTokens.slice(i, i + 500);
+
+    try {
+      const results = await firebase.messaging().sendAll(
+        batch.map(token => ({
+          token,
+          notification: {
+            title: 'New Notification',
+            body: message
+          }
+        }))
+      );
+
+      // Log failures for debugging
+      results.failures.forEach(failure => {
+        console.error(`Push failed for ${failure.error.code}: ${failure.error.message}`);
+      });
+    } catch (error) {
+      console.error('Push batch failed:', error);
+    }
+  }
+});
+
+// Optional: Webhook for external notification services
+eventBus.on('notifications:bulk-created', async (event) => {
+  const { studentIds, message } = event;
+
+  try {
+    await fetch('https://notification-service.example.com/bulk', {
+      method: 'POST',
+      body: JSON.stringify({ studentIds, message })
+    });
+  } catch (error) {
+    console.error('Webhook failed:', error);
+    // Don't block main operation
+  }
+});
+```
+
+### Tradeoffs
+
+**Advantages:**
+- ✅ **Single operation atomicity**: All 50,000 database inserts succeed or fail together
+- ✅ **Consistent state**: Database always reflects truth, even if emails fail
+- ✅ **Simpler architecture**: No message queue needed, just event emitters
+- ✅ **Immediate confirmation**: HR knows DB save succeeded instantly
+- ✅ **Decoupled channels**: Email failure doesn't affect push, and vice versa
+- ✅ **Easy recovery**: Can retry failed channels without re-saving to DB
+
+**Disadvantages:**
+- ⚠️ **External service failures not tracked**: If email fails, no retry automatically
+- ⚠️ **No built-in queue**: Losing worker process loses pending notifications
+- ⚠️ **Requires error handling discipline**: Each handler must handle its own failures
+- ⚠️ **Limited observability**: Harder to track which notifications succeeded vs failed
+- ⚠️ **Event handler crash risk**: If Node process crashes, pending handlers lost
+
+---
+
+## Revised Solution 3: Hybrid - Database + Queue (Recommended)
+
+### Architecture
+
+```
+HR "Notify All" 
+    ↓
+    ├→ [Fast] Save all to DB (atomic, immediate response)
+    │
+    └→ [Async] Queue email/push jobs for workers to process
+          ↓
+          Workers with retry logic handle failures
+```
+
+### Key Improvements
+
+```typescript
+// Best of both worlds
+async function notifyAllOptimized(studentIds, message) {
+  // PART A: Database operation (ALWAYS succeeds or fails atomically)
+  const notifications = await db.transaction(async (trx) => {
+    return await trx('notifications').insert(
+      studentIds.map(id => ({
+        id: uuid(),
+        student_id: id,
+        message: message,
+        is_read: false,
+        created_at: new Date(),
+        email_status: 'pending',      // Track each channel separately
+        push_status: 'pending'
+      }))
+    );
+  });
+
+  // If DB insert fails, entire operation fails - user gets error, nothing sent
+  // If DB insert succeeds, we proceed (guaranteed consistency)
+
+  // PART B: Queue async jobs (failures don't affect DB)
+  const emailJobs = studentIds.map((id, idx) => ({
+    type: 'send-email',
+    notificationId: notifications[idx].id,
+    studentId: id,
+    message,
+    retryCount: 0,
+    maxRetries: 3
+  }));
+
+  const pushJobs = studentIds.map((id, idx) => ({
+    type: 'send-push',
+    notificationId: notifications[idx].id,
+    studentId: id,
+    message,
+    retryCount: 0,
+    maxRetries: 3
+  }));
+
+  // Queue all jobs (no waiting, just enqueue)
+  await queue.enqueueBatch([...emailJobs, ...pushJobs]);
+
+  // Return success to user
+  return {
+    success: true,
+    notificationsCreated: notifications.length,
+    jobsQueued: emailJobs.length + pushJobs.length
+  };
+}
+```
+
+### Comparison Table
+
+| Aspect | Naive | Async Queue | DB-First Event | Hybrid |
+|--------|-------|-------------|----------------|--------|
+| **Response Time** | 5-60 mins | 100-500ms | 50-200ms | 50-200ms |
+| **Data Consistency** | ❌ Partial | ✅ Strong | ✅ Strong | ✅ Strong |
+| **Error Resilience** | ❌ None | ✅ Retry logic | ⚠️ Manual | ✅ Automatic |
+| **Partial Success** | ❌ No tracking | ✅ Tracked | ✅ Tracked | ✅ Tracked |
+| **Infrastructure** | None | Message Queue | Event Emitter | Message Queue |
+| **Complexity** | ⭐ Simple | ⭐⭐⭐⭐ Complex | ⭐⭐⭐ Medium | ⭐⭐⭐⭐ Complex |
+| **Scalability** | 0-1000 | 0-1M | 0-100K | 0-1M |
+| **Idempotent** | ❌ | ✅ | ⚠️ | ✅ |
+| **Audit Trail** | ❌ | ✅ | ✅ | ✅ |
+
+---
+
+## Critical Design Decisions
+
+### Decision 1: When Should DB Save Happen?
+
+**Question**: Should saving to DB and sending email happen together or separately?
+
+**Answer: Database first, external channels second.**
+
+```
+❌ Wrong: Send email → IF success THEN save to DB
+   Problem: Email succeeds, DB fails = notification lost
+
+✅ Correct: Save to DB → THEN send email
+   Benefit: DB state is source of truth, emails are optional deliveries
+```
+
+**Why This Matters:**
+- Database is your system of record
+- External services (email, push) are best-effort delivery channels
+- If one external service fails, others should still attempt
+- Users can always re-fetch notifications from DB
+
+### Decision 2: All-or-Nothing vs Partial Success?
+
+```
+❌ Wrong: If ANY email fails, roll back entire operation
+
+✅ Correct: 49,999 succeed, 1 fails
+   - Mark that 1 as "retry pending"
+   - Log it for manual review
+   - System stays operational
+```
+
+### Decision 3: Synchronous vs Asynchronous?
+
+```
+❌ Wrong: Block user until all 50,000 operations complete
+   - Takes 5-60 minutes
+   - HR stares at loading spinner
+   - Single email timeout blocks entire operation
+
+✅ Correct: Queue operations, return immediately
+   - User gets response in 100ms
+   - Operations process in background
+   - Failures don't cascade
+```
+
+---
+
+## Implementation Checklist for Stage 5
+
+- [ ] Create `jobs` or `notifications_batch` table to track bulk operations
+- [ ] Add `status` field to notifications table (created, emailed, pushed)
+- [ ] Implement message queue (RabbitMQ, Redis Bull, or Kafka)
+- [ ] Create worker process for background job processing
+- [ ] Add retry logic with exponential backoff (3 attempts, 1-4-16 second delays)
+- [ ] Implement batch processing (process in groups of 100-500, not 1 at a time)
+- [ ] Add idempotency keys to prevent duplicate sends
+- [ ] Create monitoring for job queue depth and worker health
+- [ ] Add `/api/jobs/{jobId}/status` endpoint for progress tracking
+- [ ] Log all successes and failures for audit trail
+- [ ] Load test with 50,000 students to verify performance
+- [ ] Document incident response: "What if email service goes down?"
+
+---
+
+## Real-World Example Scenario: How Hybrid Approach Handles Failure
+
+```
+Timeline: HR clicks "Notify All" for 50,000 students
+
+T+0ms:
+  - API receives request
+  - Database transaction begins
+  - Inserts 50,000 rows into notifications table
+  - Transaction commits ✅
+  - HR gets response: "50,000 notifications created"
+
+T+10ms:
+  - 50,000 email jobs queued
+  - 50,000 push jobs queued
+
+T+100ms:
+  - Worker #1 starts processing email batch 1-100
+  - Worker #2 starts processing email batch 101-200
+  - Worker #3 starts processing push batch 1-100
+
+T+500ms:
+  - Email service responds with timeout for student #250-300
+  - Failed emails automatically retry with 1-second delay
+  - Other workers continue processing
+
+T+1000ms:
+  - Retry attempt #2 for failed emails
+  - Success! Students #250-300 emails sent
+
+T+30 seconds:
+  - All 50,000 emails sent ✅
+  - All 50,000 push notifications sent ✅
+  - 99.5% success rate (25 failures, auto-retried 3x, manual review needed)
+  - HR checks status: "Completed: 49,975 success, 25 failed"
+  - HR clicks "Retry failed" to resend to 25 students
+
+Result: 50,000 students got notifications. System stayed operational. HR had visibility.
+```
+
+---
+
 ## Conclusion
 
-**Start with database optimization** (Stage 3 + pagination). When database hits become a bottleneck (typically at 300+ concurrent users), **add Redis caching**. Only migrate to message queues if supporting enterprise-scale deployments (10,000+ students). The hybrid approach (Redis + Browser Cache) offers the best balance of performance and complexity for most systems.
+**For bulk operations with 50,000+ targets:**
+1. Always use **asynchronous batch processing**
+2. **Save to database first**, then queue external deliveries
+3. Implement **retry logic with exponential backoff**
+4. Provide **progress tracking** via job status API
+5. Monitor for **partial failures** and allow manual retries
+6. Use **batching** (100-500 per batch) to avoid resource exhaustion
+
+The hybrid approach (database atomic save + message queue processing) provides the best balance of **reliability, speed, and operational simplicity** for this scale of operation.
