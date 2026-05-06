@@ -1,0 +1,94 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: Arial, sans-serif;
+  background: #f4f7fb;
+  color: #102a43;
+}
+
+.page {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 24px;
+  display: grid;
+  gap: 20px;
+}
+
+.panel {
+  background: #fff;
+  border-radius: 16px;
+  padding: 20px;
+  box-shadow: 0 10px 30px rgba(16, 42, 67, 0.08);
+}
+
+.subtitle {
+  margin-top: 0;
+  color: #627d98;
+}
+
+.form {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: 160px 1fr 180px;
+}
+
+.form input,
+.form select,
+.form button,
+.filters button {
+  border: 1px solid #d9e2ec;
+  border-radius: 10px;
+  padding: 12px;
+  font-size: 14px;
+}
+
+.form button,
+.filters button {
+  background: #2f80ed;
+  color: #fff;
+  cursor: pointer;
+}
+
+.filters {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+.filters button.active {
+  background: #102a43;
+}
+
+.list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.list li {
+  display: grid;
+  gap: 4px;
+  padding: 14px;
+  border-radius: 12px;
+  border: 1px solid #e6edf5;
+}
+
+.list li.unread {
+  border-left: 4px solid #2f80ed;
+}
+
+.list li.read {
+  opacity: 0.75;
+}
+
+@media (max-width: 720px) {
+  .form {
+    grid-template-columns: 1fr;
+  }
+}
