@@ -1327,3 +1327,53 @@ Result: 50,000 students got notifications. System stayed operational. HR had vis
 6. Use **batching** (100-500 per batch) to avoid resource exhaustion
 
 The hybrid approach (database atomic save + message queue processing) provides the best balance of **reliability, speed, and operational simplicity** for this scale of operation.
+
+---
+
+# Overall Architecture Roadmap
+
+## Stage-by-Stage Implementation Path
+
+| Stage | Focus | Scale | Key Decision |
+|-------|-------|-------|--------------|
+| **Stage 1** | REST API Design | Single student | How should core actions look? |
+| **Stage 2** | Database Schema | 1,000s of students | How to store and query efficiently? |
+| **Stage 3** | Query Optimization | 10,000s of students | How to make queries fast? |
+| **Stage 4** | Caching & Performance | 100,000s of students | How to reduce database load? |
+| **Stage 5** | Bulk Operations | 50,000+ simultaneous | How to handle mass notifications reliably? |
+
+## Final Recommendations
+
+### For MVP (< 1,000 students)
+- Stage 1: REST API ✅
+- Stage 2: PostgreSQL with basic schema ✅
+- Stage 3: Composite indexes ✅
+- Skip: Caching, bulk operations (premature optimization)
+
+### For Growth (1,000-10,000 students)
+- All previous stages ✅
+- Stage 4: Add Redis caching (5-minute TTL)
+- Add pagination (max 20 results per request)
+- Implement browser caching headers
+
+### For Enterprise (10,000+ students)
+- All previous stages ✅
+- Stage 4: Hybrid caching (Redis + browser)
+- Stage 5: Message queue for bulk operations
+- Add WebSocket for real-time updates
+- Consider database partitioning by date
+
+---
+
+## Core Principles Applied Throughout
+
+1. **Fail Gracefully**: Partial success is acceptable, track and retry failures
+2. **Async by Default**: Don't block users on slow external operations
+3. **Database is Source of Truth**: External services are best-effort delivery
+4. **Monitor Everything**: Track response times, error rates, queue depths
+5. **Batch When Possible**: Process 100 items at once, not 1 by 1
+6. **Retry with Backoff**: Transient failures disappear with exponential delays
+7. **Cache Strategically**: Front-load with browser cache, back-end with Redis
+8. **Pagination Always**: Never return unlimited results, start with 20
+9. **Index Deliberately**: Only index columns used in WHERE/ORDER BY/JOINs
+10. **Document Trade-offs**: Every optimization has a cost (complexity, infrastructure, money)
