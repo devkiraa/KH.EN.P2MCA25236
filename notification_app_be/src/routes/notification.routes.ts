@@ -1,10 +1,22 @@
-import { Router } from 'express';
-import { Log, setAuthToken } from '../../../logging_middleware';
+import { Router, Request, Response } from 'express';
+import { Log, setAuthToken } from 'logging-middleware';
 import { createNotifications, getNotifications, getUnreadNotifications, markAsRead } from '../services/notification.service';
+import { getConfigFromRequest } from '../middleware/config.middleware';
 
 const router = Router();
 
+// Helper to ensure token is set from current config
+const ensureLoggerToken = (req: Request): void => {
+  try {
+    const config = getConfigFromRequest(req);
+    setAuthToken(config.logger.apiToken);
+  } catch (error) {
+    console.error('Failed to set logger token:', error);
+  }
+};
+
 router.get('/notifications', async (req, res) => {
+  ensureLoggerToken(req);
   await Log('backend', 'info', 'route', 'GET /notifications called');
 
   const studentId = typeof req.query.studentId === 'string' ? req.query.studentId : undefined;
@@ -14,6 +26,7 @@ router.get('/notifications', async (req, res) => {
 });
 
 router.get('/notifications/unread', async (req, res) => {
+  ensureLoggerToken(req);
   await Log('backend', 'info', 'route', 'GET /notifications/unread called');
 
   const studentId = typeof req.query.studentId === 'string' ? req.query.studentId : 'student-001';
@@ -23,6 +36,7 @@ router.get('/notifications/unread', async (req, res) => {
 });
 
 router.post('/notifications', async (req, res) => {
+  ensureLoggerToken(req);
   await Log('backend', 'info', 'controller', 'POST /notifications called');
 
   const { studentIds, type, message } = req.body as {
@@ -42,6 +56,7 @@ router.post('/notifications', async (req, res) => {
 });
 
 router.patch('/notifications/:id/read', async (req, res) => {
+  ensureLoggerToken(req);
   await Log('backend', 'warn', 'controller', 'PATCH /notifications/:id/read called');
 
   const updated = markAsRead(req.params.id);
@@ -53,9 +68,24 @@ router.patch('/notifications/:id/read', async (req, res) => {
   res.json({ success: true, message: 'Notification marked as read' });
 });
 
-router.post('/logging-token', (_req, res) => {
-  setAuthToken(process.env.ACCESS_TOKEN || process.env.API_TOKEN || '');
-  res.json({ success: true, message: 'Logger token refreshed' });
+router.get('/config', (req: Request, res: Response) => {
+  try {
+    const config = getConfigFromRequest(req);
+    res.json({
+      success: true,
+      config: {
+        environment: config.environment,
+        port: config.port,
+        logger: {
+          apiUrl: config.logger.apiUrl,
+          timeout: config.logger.timeout,
+          // Don't expose token in response
+        }
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Failed to retrieve config' });
+  }
 });
 
 export default router;

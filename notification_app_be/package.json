@@ -12,7 +12,8 @@
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "logging-middleware": "file:../logging_middleware"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
