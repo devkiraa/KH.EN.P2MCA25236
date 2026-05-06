@@ -137,3 +137,73 @@ WHERE type = 'Placement'
   AND created_at >= NOW() - INTERVAL '7 days'
 ORDER BY created_at DESC;
 ```
+
+# Stage 3
+
+## Is the Query Correct?
+
+The query works, but it is not optimal.
+
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+## Why It Is Slow
+
+- It uses `SELECT *`, so it reads extra columns
+- It has no good index for `studentID` and `isRead`
+- It sorts records with `ORDER BY`, which takes time
+- With 5,000,000 rows, a table scan becomes expensive
+
+## What I Would Change
+
+Use only the needed columns and add a composite index.
+
+```sql
+SELECT id, type, message, createdAt
+FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt DESC
+LIMIT 20;
+```
+
+## Likely Computation Cost
+
+- Without index: close to `O(n)` because many rows may be scanned
+- With index: much faster, closer to `O(log n + k)`
+
+This can help keep the response under **500ms** for normal load.
+
+## Should We Add Indexes on Every Column?
+
+No.
+
+That is not a good idea because:
+
+- It slows down `INSERT` and `UPDATE`
+- It uses extra storage
+- It makes the database heavier to maintain
+
+Add indexes only on columns used in `WHERE`, `ORDER BY`, and joins.
+
+## Best Index for This Case
+
+```sql
+CREATE INDEX idx_notifications_student_read_created
+ON notifications (studentID, isRead, createdAt DESC);
+```
+
+## Query for Placement Notifications in Last 7 Days
+
+```sql
+SELECT DISTINCT studentID
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= NOW() - INTERVAL '7 days';
+```
+
+## Simple Final Answer
+
+The query is correct, but slow. Use a composite index, avoid `SELECT *`, and return only the needed rows so the response stays fast, ideally under **500ms**.
