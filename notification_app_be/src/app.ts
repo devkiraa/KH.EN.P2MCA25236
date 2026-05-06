@@ -1,6 +1,7 @@
 import cors from 'cors';
 import express from 'express';
 import notificationRoutes from './routes/notification.routes';
+import priorityRoutes from './routes/priority.routes';
 import { errorMiddleware } from './middleware/error.middleware';
 import { configMiddleware } from './middleware/config.middleware';
 import { loggingMiddleware, responseLoggingMiddleware } from './middleware/logging.middleware';
@@ -38,6 +39,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.use('/api', notificationRoutes);
+app.use('/api', priorityRoutes);
 
 // ===== Error Handling =====
 app.use(errorMiddleware);
